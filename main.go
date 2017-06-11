@@ -18,17 +18,19 @@ import (
 )
 
 var (
-	logger       = log.New(os.Stdout, "", log.LstdFlags)
-	src          = flag.String("src", ".", "Specify the source directory to scan image from")
-	dest         = flag.String("dest", "ready", "Specify the destination directory to save image to")
-	ext          = flag.String("ext", ".jpg", "File extension used to filter images")
-	loc          = flag.String("location", "", "Location to add to the date, will be formatted using --format if not empty; otherwise only 'date' will be displayed")
-	format       = flag.String("format", "%v, %v", "Format used to combine date & location")
-	textSize     = flag.Int("text-size", 100, "Text size used to display annotation text, in point")
-	bottomMargin = flag.Int("bottom-margin", 30, "Bottom margin to adjust text centering, in px")
-	font         = flag.String("font", "Arial", "Font used to write annotation")
-	useGoroutine = flag.Bool("use-goroutine", false, "Are goroutine used?")
-	help         = flag.Bool("help", false, "Display default flag")
+	logger        = log.New(os.Stdout, "", log.LstdFlags)
+	src           = flag.String("src", ".", "Specify the source directory to scan image from")
+	dest          = flag.String("dest", "ready", "Specify the destination directory to save image to")
+	ext           = flag.String("ext", ".jpg", "File extension used to filter images")
+	loc           = flag.String("location", "", "Location to add to the date, will be formatted using --format if not empty; otherwise only 'date' will be displayed")
+	format        = flag.String("format", "%v, %v", "Format used to combine date & location")
+	textSize      = flag.Int("text-size", 100, "Text size used to display annotation text, in point")
+	bottomMargin  = flag.Int("bottom-margin", 30, "Bottom margin to adjust text centering, in px")
+	font          = flag.String("font", "Arial", "Font used to write annotation")
+	useGoroutine  = flag.Bool("use-goroutine", false, "Are goroutine used?")
+	maxGoroutines = flag.Int("max-goroutines", 10, "Maximum number of goroutines to run in parallel, equivalent to maximum images to resize in parallel")
+	help          = flag.Bool("help", false, "Display default flag")
+	guard         chan struct{}
 )
 
 var formats = map[string]string{
@@ -49,6 +51,11 @@ var formats = map[string]string{
 func main() {
 	// First retrieve CLI flags values to check if help is necessary, just in case
 	flag.Parse()
+
+	// In case of a parallel run, let's initialize a guard to avoid running too much concurrent goroutines
+	if *useGoroutine {
+		guard = make(chan struct{}, *maxGoroutines)
+	}
 
 	// Ok, for now help is just defaults
 	// TODO : add app presentation & a little bit more description, just because you  can
@@ -84,6 +91,8 @@ func actOnFiles(wg *sync.WaitGroup, files []os.FileInfo, location string, source
 	logger.Printf("%v files to process on directory %v", len(files), source)
 	for _, file := range files {
 		if *useGoroutine {
+			guard <- struct{}{} // would block if guard channel is already filled
+
 			wg.Add(1)
 
 			go func(sy *sync.WaitGroup, f os.FileInfo, loca string, sour string, des string) {
@@ -98,6 +107,12 @@ func actOnFiles(wg *sync.WaitGroup, files []os.FileInfo, location string, source
 }
 
 func actOnFile(wg *sync.WaitGroup, f os.FileInfo, location string, source string, destination string) {
+	if *useGoroutine {
+		defer func() {
+			<-guard
+		}()
+	}
+
 	if f.IsDir() {
 		if f.Name() != path.Base(destination) {
 			newSource := path.Join(source, f.Name())
@@ -150,7 +165,7 @@ func actOnFile(wg *sync.WaitGroup, f os.FileInfo, location string, source string
 	} else {
 		annotation = displayedDate
 	}
-	annotateImageWith(source, f, destination, annotation, *textSize, *bottomMargin, *font)
+	annotateImageWith(source, f, destination, annotation, *textSize, *bottomMargin)
 }
 
 func localizeDate(date time.Time, layout string) string {
@@ -166,12 +181,12 @@ func extractExifInfoFrom(rootDirectory string, image os.FileInfo) string {
 	return string(out)
 }
 
-func annotateImageWith(rootDirectory string, image os.FileInfo, destination string, annotation string, textInPointSize int, bottomMargin int, font string) {
+func annotateImageWith(rootDirectory string, image os.FileInfo, destination string, annotation string, textInPointSize int, bottomMargin int) {
 	bottomHeightInPixel := 350
 	textInPixel := (float32(textInPointSize) / 0.75) / 2
 	textPositionFromBottom := (float32(bottomHeightInPixel) / 2) - (textInPixel / 2) - float32(bottomMargin)
 	annotateFormat := fmt.Sprintf("+0+%d", int32(textPositionFromBottom))
-	cmd := exec.Command("convert", path.Join(rootDirectory, image.Name()), "-font", font, "-pointsize", strconv.Itoa(textInPointSize), "-fill", "black", "-gravity", "south", "-annotate", annotateFormat, normalizeUtf8Style(annotation), path.Join(destination, image.Name()))
+	cmd := exec.Command("convert", path.Join(rootDirectory, image.Name()), "-font", *font, "-pointsize", strconv.Itoa(textInPointSize), "-fill", "black", "-gravity", "south", "-annotate", annotateFormat, normalizeUtf8Style(annotation), path.Join(destination, image.Name()))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		logger.Println("Call to convert return following error :", err, string(out))
